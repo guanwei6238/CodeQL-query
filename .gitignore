@@ -10,3 +10,4 @@ missing.csv
 .vscode
 Cargo.lock
 Cargo.toml
+target
