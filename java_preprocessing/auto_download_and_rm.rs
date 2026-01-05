@@ -6,6 +6,7 @@
 //! serde = { version = "1.0.228", features = ["derive"] }
 //! serde_json = "1.0.148"
 //! ```
+/// 使用實際的將 java_autoql.sh 的掃描部分 (最後for 迴圈) 註解掉。
 use clap::Parser;
 use csv::Reader;
 use serde::Deserialize;
@@ -17,7 +18,7 @@ use std::{
     process::{Command, ExitStatus},
     time::Instant,
 };
-const LIMIT_SECS: u64 = 300;
+const LIMIT_SECS: u64 = 270; // 4.5 minutes
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
