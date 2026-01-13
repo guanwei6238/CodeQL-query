@@ -164,3 +164,17 @@ sdk install gradle 8.10.2
 sdk default maven 3.9.9
 sdk default gradle 8.10.2
 ```
+
+## data_process
+將自動化後的 query_statistics 資料夾轉成報告
+### 安裝
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo install rust-script # 要下載這個才能執行單一rs檔案
+```
+### 使用
+```bash
+rust-script data_process.rs
+# 查看參數
+rust-script data_process.rs -h
+```
