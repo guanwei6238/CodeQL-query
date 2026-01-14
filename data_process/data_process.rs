@@ -83,7 +83,7 @@ fn report_process(
         let len = record.len();
         for (i, round) in record.iter().take(len - 1).skip(2).enumerate() {
             match round.trim() {
-                "#" => {
+                "#" | "" => {
                     project_stats.scan_skipped += 1;
                     round_stats.get_mut(i).map(|rs| rs.skipped += 1);
                 }
