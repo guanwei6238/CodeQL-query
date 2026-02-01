@@ -411,12 +411,9 @@ def remove_targets_and_report(
     if mode == "call":
         prompt_lines: List[str] = []
         for rel, ranges in sorted(report.items(), key=lambda kv: kv[0]):
-            fn_set = {fn for (_, _, fn) in ranges if fn}
-            if not fn_set:
+            if not any(fn for (_, _, fn) in ranges):
                 continue
-            fn_list = sorted(fn_set, key=lambda s: s.lower())
-            fn_part = "、".join(f"{name}()" for name in fn_list)
-            prompt_lines.append(f"{rel}|{fn_part}")
+            prompt_lines.append(rel)
 
         prompt_path = cp_root / "prompt.txt"
         with prompt_path.open("w", encoding="utf-8") as pf:
