@@ -180,7 +180,6 @@ fn main() {
             "--all",
             "--cwe",
             args.cwe.as_str(),
-            "--one-fn-per-file",
         ])
         .status()
         .expect("failed to execute python script");

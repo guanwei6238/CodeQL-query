@@ -11,7 +11,7 @@ from typing import List, Tuple
 
 
 DEFAULT_PROJECTS_DIR = Path("./projects")
-DEFAULT_JSON_ROOT = Path("./cpp_preprocessing/cpp_query_output")
+DEFAULT_JSON_ROOT = Path("./java_preprocessing/java_query_output")
 DEFAULT_TARGET_SCRIPT = Path("./rm_project_call_function.py")
 
 
