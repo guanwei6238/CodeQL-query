@@ -11,3 +11,4 @@ missing.csv
 Cargo.lock
 Cargo.toml
 target
+cpp_preprocessing/auto_download_and_rm
