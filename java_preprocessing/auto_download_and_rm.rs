@@ -18,7 +18,7 @@ use std::{
     process::{Command, ExitStatus},
     time::Instant,
 };
-const LIMIT_SECS: u64 = 270; // 4.5 minutes
+const LIMIT_SECS: u64 = 500; // 8.3 minutes
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
@@ -72,6 +72,7 @@ fn main() {
             }
         }
     }
+    let mut accepted_repos: Vec<String> = Vec::new();
     let mut count = 0;
     for res in rdr.deserialize::<Row>() {
         let row = res.expect("Cannot deserialize row");
@@ -161,6 +162,7 @@ fn main() {
                 continue;
             }
             count += file_paths.len();
+            accepted_repos.push(repo_name.to_string());
             println!(
                 "Accepted repo: {}, files found: {}, real time: {}s, cumulative count: {}",
                 row.full_name,
@@ -173,18 +175,24 @@ fn main() {
             break;
         }
     }
-    let status = Command::new("python")
-        .current_dir("../")
-        .args([
-            "run_rm_project_call_function.py",
-            "--all",
-            "--cwe",
-            args.cwe.as_str(),
-        ])
-        .status()
-        .expect("failed to execute python script");
-    if !status.success() {
-        eprintln!("run_rm_project_call_function.py execute failed.");
+    for repo_name in &accepted_repos {
+        let status = Command::new("python3")
+            .current_dir("../")
+            .args([
+                "run_rm_project_call_function.py",
+                "--project",
+                repo_name.as_str(),
+                "--cwe",
+                args.cwe.as_str(),
+            ])
+            .status()
+            .expect("failed to execute python script");
+        if !status.success() {
+            eprintln!(
+                "run_rm_project_call_function.py failed for project: {}",
+                repo_name
+            );
+        }
     }
     let status = Command::new("python")
         .current_dir("../")
