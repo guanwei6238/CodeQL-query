@@ -504,26 +504,152 @@ def append_global_prompt(global_prompt_path: Path, project_name: str, prompt_lin
 
 
 def build_output_project_dir(output_dir: Path, project_name: str, cwe3: str) -> Path:
-    return output_dir / f"{safe_name(project_name)}__CWE-{cwe3}__CODEQL_SEMGREP_LINES"
+    return output_dir / safe_name(project_name)
 
 
-def scan_project(project_dir: Path, cwe3: str, codeql_cwe_root: Path, codeql_timeout: int) -> Tuple[Optional[Dict[str, List[Tuple[int, int]]]], List[str]]:
+def build_cache_report_path(cache_dir: Path, project_name: str, cwe3: str) -> Path:
+    return cache_dir / project_name / f"CWE-{cwe3}.json"
+
+
+def findings_to_cache_report(
+    *,
+    cwe3: str,
+    project_name: str,
+    full_name: str,
+    findings: Sequence[Tuple[str, int, int, str]],
+    messages: Sequence[str],
+) -> dict:
+    return {
+        "cwe": cwe3,
+        "project": project_name,
+        "full_name": full_name,
+        "findings": [
+            {
+                "file": rel_path,
+                "start_line": start_line,
+                "end_line": end_line,
+                "scanner": scanner,
+            }
+            for rel_path, start_line, end_line, scanner in findings
+        ],
+        "messages": list(messages),
+    }
+
+
+def write_cache_report(cache_path: Path, report: dict) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_cache_report(cache_path: Path) -> dict:
+    return json.loads(cache_path.read_text(encoding="utf-8", errors="replace"))
+
+
+def cache_report_to_file_ranges(report: dict) -> Dict[str, List[Tuple[int, int]]]:
+    file_ranges: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
+    for finding in report.get("findings", []) or []:
+        rel_path = norm_rel_path(finding.get("file") or "")
+        start_line = int(finding.get("start_line", 0) or 0)
+        end_line = int(finding.get("end_line", start_line) or start_line)
+        if rel_path and start_line > 0 and end_line > 0:
+            file_ranges[rel_path].append((start_line, end_line))
+    return dict(file_ranges)
+
+
+def scan_project(project_dir: Path, cwe3: str, codeql_cwe_root: Path, codeql_timeout: int) -> Tuple[Optional[Dict[str, List[Tuple[int, int]]]], List[str], List[Tuple[str, int, int, str]]]:
     codeql_findings, codeql_failure = scan_codeql_repo(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
     if codeql_failure and codeql_findings is None:
-        return None, [codeql_failure]
+        return None, [codeql_failure], []
     semgrep_findings, semgrep_failure = scan_semgrep_repo(project_dir, cwe3)
     messages: List[str] = []
     if codeql_failure:
         messages.append(codeql_failure)
     if semgrep_failure:
         messages.append(semgrep_failure)
-    merged_ranges = collect_file_ranges([*(codeql_findings or []), *semgrep_findings])
-    return merged_ranges, messages
+    raw_findings = [(*item, "codeql") for item in (codeql_findings or [])] + [(*item, "semgrep") for item in semgrep_findings]
+    merged_ranges = collect_file_ranges([(path, start, end) for path, start, end, _ in raw_findings])
+    return merged_ranges, messages, raw_findings
 
 
-def process_project(row: dict, project_dir: Path, output_dir: Path, cwe3: str, codeql_cwe_root: Path, codeql_timeout: int) -> Tuple[str, List[str], int]:
+def process_project(
+    row: dict,
+    project_dir: Path,
+    output_dir: Path,
+    cwe3: str,
+    codeql_cwe_root: Path,
+    codeql_timeout: int,
+    *,
+    cache_dir: Optional[Path] = None,
+    use_cache: bool = False,
+    scan_only: bool = False,
+) -> Tuple[str, List[str], int]:
     full_name = (row.get("full_name") or "").strip() or project_dir.name
-    file_ranges, messages = scan_project(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
+    cache_path = build_cache_report_path(cache_dir, project_dir.name, cwe3) if cache_dir else None
+
+    if scan_only:
+        if cache_path and cache_path.exists():
+            report_data = read_cache_report(cache_path)
+            file_ranges = cache_report_to_file_ranges(report_data)
+            messages = list(report_data.get("messages", []) or [])
+            if file_ranges:
+                print(f"[SCANNED] {full_name}: cache exists, skip rescanning")
+                return "scanned", messages, len(file_ranges)
+            print(f"[SCANNED] {full_name}: cache exists, no findings")
+            return "scanned", messages, 0
+        file_ranges, messages, raw_findings = scan_project(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
+        if cache_path and raw_findings is not None:
+            write_cache_report(
+                cache_path,
+                findings_to_cache_report(
+                    cwe3=cwe3,
+                    project_name=project_dir.name,
+                    full_name=full_name,
+                    findings=raw_findings,
+                    messages=messages,
+                ),
+            )
+        if file_ranges is None:
+            print(f"[SKIP] {full_name}: {messages[0]}")
+            return "skipped", messages, 0
+        if not file_ranges:
+            extra = f" ({'; '.join(messages)})" if messages else ""
+            print(f"[SCANNED] {full_name}: no CWE-{cwe3} findings{extra}")
+            return "scanned", messages, 0
+        print(f"[SCANNED] {full_name}: cached findings={len(file_ranges)}")
+        return "scanned", messages, len(file_ranges)
+
+    if use_cache:
+        if cache_path and cache_path.exists():
+            report_data = read_cache_report(cache_path)
+            file_ranges = cache_report_to_file_ranges(report_data)
+            messages = list(report_data.get("messages", []) or [])
+        else:
+            file_ranges, messages, raw_findings = scan_project(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
+            if cache_path and raw_findings is not None:
+                write_cache_report(
+                    cache_path,
+                    findings_to_cache_report(
+                        cwe3=cwe3,
+                        project_name=project_dir.name,
+                        full_name=full_name,
+                        findings=raw_findings,
+                        messages=messages,
+                    ),
+                )
+    else:
+        file_ranges, messages, raw_findings = scan_project(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
+        if cache_path and raw_findings is not None:
+            write_cache_report(
+                cache_path,
+                findings_to_cache_report(
+                    cwe3=cwe3,
+                    project_name=project_dir.name,
+                    full_name=full_name,
+                    findings=raw_findings,
+                    messages=messages,
+                ),
+            )
+
     if file_ranges is None:
         print(f"[SKIP] {full_name}: {messages[0]}")
         return "skipped", messages, 0
@@ -548,6 +674,7 @@ def main() -> int:
     parser.add_argument("--csv", default="./repos/repos_java.csv", help="Path to repos_java.csv")
     parser.add_argument("--projects-dir", default="./projects", help="Directory where repos are cloned")
     parser.add_argument("--output-dir", default="./rm_output", help="Output root for copied and modified projects")
+    parser.add_argument("--cache-dir", default="./java_scan_cache", help="Directory for cached scan reports")
     parser.add_argument("--global-prompt", default=None, help="Global prompt.txt path (default: <output-dir>/prompt.txt)")
     parser.add_argument("--cwe", required=True, help="Target CWE, for example 022 or CWE-022")
     parser.add_argument("--codeql-cwe-root", default=None, help="Override CodeQL Java query root")
@@ -556,6 +683,8 @@ def main() -> int:
     parser.add_argument("--limit-projects", type=int, default=0, help="Maximum number of CSV rows to inspect; 0 means unlimited")
     parser.add_argument("--project-filter", default=None, help="Only process rows whose full_name contains this string")
     parser.add_argument("--git-depth", type=int, default=1, help="git clone depth; 0 means full clone")
+    parser.add_argument("--scan-only", action="store_true", help="Only scan and write cache reports; do not remove code")
+    parser.add_argument("--use-cache", action="store_true", help="Use cached reports instead of rescanning")
     args = parser.parse_args()
 
     cwe3 = normalize_cwe(args.cwe)
@@ -566,7 +695,13 @@ def main() -> int:
     csv_path = Path(args.csv).expanduser().resolve()
     projects_dir = Path(args.projects_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
+    cache_dir = Path(args.cache_dir).expanduser().resolve()
     global_prompt_path = Path(args.global_prompt).expanduser().resolve() if args.global_prompt else (output_dir / "prompt.txt")
+
+    if args.scan_only and args.use_cache:
+        print("[ERROR] --scan-only and --use-cache cannot be used together")
+        return 2
+
     if not csv_path.exists():
         print(f"[ERROR] csv not found: {csv_path}")
         return 2
@@ -578,6 +713,7 @@ def main() -> int:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     projects_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
     initial_global_lines = count_lines(global_prompt_path)
     if args.global_prompt_max_lines > 0 and initial_global_lines >= args.global_prompt_max_lines:
@@ -601,7 +737,7 @@ def main() -> int:
             continue
         if args.limit_projects > 0 and inspected >= args.limit_projects:
             break
-        if args.global_prompt_max_lines > 0 and global_lines >= args.global_prompt_max_lines:
+        if args.use_cache and args.global_prompt_max_lines > 0 and global_lines >= args.global_prompt_max_lines:
             print(f"[STOP] global prompt reached limit: {global_lines}/{args.global_prompt_max_lines}")
             break
 
@@ -625,6 +761,9 @@ def main() -> int:
             cwe3=cwe3,
             codeql_cwe_root=codeql_cwe_root or DEFAULT_CODEQL_CWE_ROOT,
             codeql_timeout=args.codeql_timeout,
+            cache_dir=cache_dir,
+            use_cache=args.use_cache,
+            scan_only=args.scan_only,
         )
         if status == "removed":
             removed_projects += 1
@@ -636,6 +775,8 @@ def main() -> int:
                 max_lines=args.global_prompt_max_lines,
             )
             print(f"[PROMPT] {full_name}: project_lines={prompt_line_count} global_lines={global_lines}")
+        elif status == "scanned":
+            clean_projects += 1
         elif status == "clean":
             clean_projects += 1
         else:
