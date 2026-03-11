@@ -7,6 +7,8 @@
 #   --output-dir ./rm_output_java \
 #   --global-prompt-max-lines 100
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -14,13 +16,21 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote
 
-from java_preprocessing.cwe_detector import CWEDetector, ScannerType
-
+CODEQL_BIN = "codeql"
+CODEQL_LANG = "java"
 DEFAULT_CODEQL_CWE_ROOT = Path("/tmp/share/codeql/qlpacks/codeql/java-queries/1.6.3/Security/CWE")
+
+CODEQL_SUPPORTED_CWES = [
+    "022", "078", "079", "113", "117",
+    "326", "327", "329", "347",
+    "502", "643", "918", "1333",
+]
 
 SEMGREP_RULES: Dict[str, List[str]] = {
     "022": [
@@ -133,6 +143,9 @@ SEMGREP_RULES: Dict[str, List[str]] = {
     ],
 }
 
+SEMGREP_SUPPORTED_CWES = sorted(SEMGREP_RULES.keys())
+SUPPORTED_CWES = sorted(set(CODEQL_SUPPORTED_CWES) | set(SEMGREP_SUPPORTED_CWES))
+
 
 def normalize_cwe(cwe: str) -> str:
     digits = re.sub(r"(?i)cwe[-_\s]*|[^0-9]", "", str(cwe or "")).lstrip("0") or "0"
@@ -187,6 +200,52 @@ def count_lines(path: Path) -> int:
         return sum(1 for _ in handle)
 
 
+def check_command(command: str) -> bool:
+    try:
+        proc = subprocess.run([command, "--version"], capture_output=True, text=True, timeout=5)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def run_cmd(
+    cmd: List[str],
+    *,
+    cwd: Optional[Path] = None,
+    timeout_sec: Optional[int] = None,
+) -> Tuple[int, float, str, str]:
+    start = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+        )
+        return proc.returncode, time.perf_counter() - start, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as exc:
+        return 124, time.perf_counter() - start, exc.stdout or "", exc.stderr or f"timeout after {timeout_sec}s"
+
+
+def norm_rel_path(path: str) -> str:
+    if path is None:
+        return ""
+    value = str(path).strip()
+    if not value:
+        return ""
+    if value.startswith("file://"):
+        value = value[7:]
+    value = unquote(value)
+    value = value.replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    return value
+
+
 def resolve_codeql_cwe_root(override: Optional[str]) -> Optional[Path]:
     candidates: List[Path] = []
     if override:
@@ -199,6 +258,74 @@ def resolve_codeql_cwe_root(override: Optional[str]) -> Optional[Path]:
     return None
 
 
+def resolve_cwe_queries_from_dir(root: Path) -> List[str]:
+    if not root.exists() or not root.is_dir():
+        return []
+    supported_nums = {int(x) for x in CODEQL_SUPPORTED_CWES}
+    queries: List[str] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        match = re.match(r"(?i)^cwe-(\d+)$", child.name)
+        if not match:
+            continue
+        if int(match.group(1)) not in supported_nums:
+            continue
+        for query in child.rglob("*.ql"):
+            if query.is_file():
+                queries.append(str(query.resolve()))
+    return sorted(set(queries))
+
+
+def parse_sarif_results(sarif_file: Path, target_cwe: str) -> List[Tuple[str, int, int]]:
+    if not sarif_file.exists():
+        return []
+    target_cwe = normalize_cwe(target_cwe)
+    cwe_int = int(target_cwe)
+    needle_a = f"cwe-{target_cwe}".lower()
+    needle_b = f"cwe-{cwe_int}".lower()
+    data = json.loads(sarif_file.read_text(encoding="utf-8", errors="replace"))
+
+    findings: List[Tuple[str, int, int]] = []
+    for run in data.get("runs", []) or []:
+        rules = {rule.get("id"): rule for rule in run.get("tool", {}).get("driver", {}).get("rules", []) or []}
+        for result in run.get("results", []) or []:
+            rule_id = (result.get("ruleId") or "").strip()
+            rule_info = rules.get(rule_id, {}) or {}
+            tags = [str(tag).lower() for tag in (rule_info.get("properties", {}).get("tags", []) or [])]
+            if not ((needle_a in rule_id.lower()) or (needle_b in rule_id.lower()) or any((needle_a in tag) or (needle_b in tag) for tag in tags)):
+                continue
+            locations = result.get("locations", []) or []
+            if not locations:
+                continue
+            phys = locations[0].get("physicalLocation", {}) or {}
+            rel_path = norm_rel_path(phys.get("artifactLocation", {}).get("uri", "") or "")
+            if not rel_path:
+                continue
+            region = phys.get("region", {}) or {}
+            start_line = int(region.get("startLine", 0) or 0)
+            end_line = int(region.get("endLine", start_line) or start_line)
+            if start_line > 0 and end_line > 0:
+                findings.append((rel_path, start_line, end_line))
+    return findings
+
+
+def parse_semgrep_results(semgrep_json: Path) -> List[Tuple[str, int, int]]:
+    if not semgrep_json.exists():
+        return []
+    data = json.loads(semgrep_json.read_text(encoding="utf-8", errors="replace"))
+    findings: List[Tuple[str, int, int]] = []
+    for result in data.get("results", []) or []:
+        rel_path = norm_rel_path(result.get("path") or "")
+        start = result.get("start", {}) or {}
+        end = result.get("end", {}) or {}
+        start_line = int(start.get("line", 0) or 0)
+        end_line = int(end.get("line", 0) or start_line)
+        if rel_path and start_line > 0 and end_line > 0:
+            findings.append((rel_path, start_line, end_line))
+    return findings
+
+
 def load_csv_rows(csv_path: Path) -> List[dict]:
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         return list(csv.DictReader(handle))
@@ -206,9 +333,7 @@ def load_csv_rows(csv_path: Path) -> List[dict]:
 
 def repo_name_from_row(row: dict) -> str:
     full_name = (row.get("full_name") or "").strip().strip("/")
-    if "/" not in full_name:
-        return full_name
-    return full_name.rsplit("/", 1)[-1]
+    return full_name.rsplit("/", 1)[-1] if "/" in full_name else full_name
 
 
 def ensure_repo_cloned(projects_dir: Path, row: dict, git_depth: int) -> Tuple[Optional[Path], Optional[str]]:
@@ -221,207 +346,119 @@ def ensure_repo_cloned(projects_dir: Path, row: dict, git_depth: int) -> Tuple[O
 
     project_dir = (projects_dir / repo_name).resolve()
     if project_dir.exists():
-        if project_dir.is_dir():
-            return project_dir, None
-        return None, f"target path exists but is not a directory: {project_dir}"
+        return (project_dir, None) if project_dir.is_dir() else (None, f"target path exists but is not a directory: {project_dir}")
 
     project_dir.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["git", "clone"]
     if git_depth > 0:
         cmd.extend(["--depth", str(git_depth)])
     cmd.extend(["--recurse-submodules", "--shallow-submodules", clone_url, str(project_dir)])
-
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         msg = (proc.stderr or proc.stdout or "").strip()
         return None, f"git clone failed (rc={proc.returncode}): {msg[:1000]}"
     return project_dir, None
 
 
-class TimeoutCWEDetector(CWEDetector):
-    def __init__(self, codeql_timeout_sec: int):
-        self.codeql_timeout_sec = codeql_timeout_sec
-        super().__init__()
+def scan_codeql_repo(project_dir: Path, cwe3: str, codeql_cwe_root: Path, codeql_timeout: int) -> Tuple[Optional[List[Tuple[str, int, int]]], Optional[str]]:
+    if cwe3 not in CODEQL_SUPPORTED_CWES:
+        return [], f"CodeQL does not support CWE-{cwe3}"
+    if not check_command(CODEQL_BIN):
+        return None, "CodeQL not available on PATH"
 
-    def _scan_codeql_to_sarif(self, project_path: Path, outdir: Path, cwe: str):  # type: ignore[override]
-        outdir = self._ensure_dir(outdir)
-        sarif_path = outdir / "report.sarif"
+    queries = resolve_cwe_queries_from_dir(codeql_cwe_root)
+    target_num = int(cwe3)
+    active_queries = []
+    for query in queries:
+        for part in Path(query).parts:
+            match = re.match(r"(?i)^cwe-(\d+)$", part)
+            if match and int(match.group(1)) == target_num:
+                active_queries.append(query)
+                break
+    if not active_queries:
+        return None, f"No CodeQL queries found for CWE-{cwe3} under {codeql_cwe_root}"
 
-        cwe3 = self._normalize_cwe3(cwe)
-        if not cwe3.isdigit():
-            return None, f"Invalid CWE value: {cwe!r}"
-        target_num = int(cwe3)
+    with tempfile.TemporaryDirectory(prefix="codeql_db_") as dbdir:
+        db_path = Path(dbdir) / "db"
+        create_cmd = [
+            CODEQL_BIN, "database", "create", str(db_path),
+            f"--language={CODEQL_LANG}",
+            "--source-root", str(project_dir),
+            "--build-mode=none",
+            "--threads=0",
+            "--overwrite",
+        ]
+        rc, _, out, err = run_cmd(create_cmd, cwd=project_dir, timeout_sec=codeql_timeout)
+        msg = (err or out or "").strip()
+        if rc != 0:
+            if rc == 124:
+                return None, f"codeql database create timeout after {codeql_timeout}s"
+            return None, f"codeql database create failed (rc={rc}): {msg[:2000]}"
 
-        if cwe3 not in self.CODEQL_SUPPORTED_CWES:
-            return None, f"CWE-{cwe3} is not supported by CodeQL scanner"
-        if ScannerType.CODEQL not in self.available_scanners:
-            return None, "CodeQL not available on PATH"
-
-        def is_query_for_target(path_str: str) -> bool:
-            path = Path(path_str)
-            for part in path.parts:
-                match = re.match(r"(?i)^cwe-(\d+)$", part)
-                if match and int(match.group(1)) == target_num:
-                    return True
-            return False
-
-        active_queries = [query for query in self.codeql_queries if is_query_for_target(query)]
-        if not active_queries:
-            return None, f"No CodeQL queries found for CWE-{cwe3} under {self.CODEQL_CWE_ROOT}"
-
-        build_info = {
-            "strategy": "build-mode=none",
-            "tool": "none",
-            "build_cmd": "",
-            "db_create_attempts": [],
-            "analyze": None,
-        }
-
-        with tempfile.TemporaryDirectory(prefix="codeql_db_") as dbdir:
-            db_path = Path(dbdir) / "db"
-            create_cmd = [
-                self.CODEQL_BIN,
-                "database",
-                "create",
-                str(db_path),
-                f"--language={self.CODEQL_LANG}",
-                "--source-root",
-                str(project_path),
-                "--build-mode=none",
-                "--threads=0",
-                "--overwrite",
-            ]
-            rc, _, out, err = self._run_cmd(
-                create_cmd,
-                cwd=project_path,
-                timeout_sec=self.codeql_timeout_sec,
-            )
-            msg = (err or out or "").strip()
-            build_info["db_create_attempts"].append(
-                {
-                    "name": "build-mode=none",
-                    "rc": rc,
-                    "msg": msg[:2000],
-                    "timeout_sec": self.codeql_timeout_sec,
-                }
-            )
-            self._last_codeql_build_info = build_info
-            if rc != 0:
-                if rc == 124:
-                    return None, f"codeql database create timeout after {self.codeql_timeout_sec}s"
-                return None, f"codeql database create failed (rc={rc}): {msg[:2000]}"
-
-            analyze_cmd = [
-                self.CODEQL_BIN,
-                "database",
-                "analyze",
-                str(db_path),
-                *active_queries,
-                "--format=sarif-latest",
-                "--output",
-                str(sarif_path),
-            ]
-            rc, _, out, err = self._run_cmd(
-                analyze_cmd,
-                cwd=project_path,
-                timeout_sec=self.codeql_timeout_sec,
-            )
-            msg = (err or out or "").strip()
-            build_info["analyze"] = {
-                "rc": rc,
-                "msg": msg[:2000],
-                "timeout_sec": self.codeql_timeout_sec,
-            }
-            self._last_codeql_build_info = build_info
-            if rc != 0:
-                if rc == 124:
-                    return None, f"codeql analyze timeout after {self.codeql_timeout_sec}s"
-                return None, f"codeql analyze failed (rc={rc}): {msg[:2000]}"
-
-        if not sarif_path.exists():
-            return None, "CodeQL finished without generating SARIF output"
-        return sarif_path, None
+        sarif_path = Path(dbdir) / "report.sarif"
+        analyze_cmd = [
+            CODEQL_BIN, "database", "analyze", str(db_path),
+            *active_queries,
+            "--format=sarif-latest",
+            "--output", str(sarif_path),
+        ]
+        rc, _, out, err = run_cmd(analyze_cmd, cwd=project_dir, timeout_sec=codeql_timeout)
+        msg = (err or out or "").strip()
+        if rc != 0:
+            if rc == 124:
+                return None, f"codeql analyze timeout after {codeql_timeout}s"
+            return None, f"codeql analyze failed (rc={rc}): {msg[:2000]}"
+        return parse_sarif_results(sarif_path, cwe3), None
 
 
-def scan_semgrep_repo(
-    detector: TimeoutCWEDetector,
-    project_dir: Path,
-    outdir: Path,
-    cwe3: str,
-) -> Tuple[List, Optional[str]]:
-    outdir.mkdir(parents=True, exist_ok=True)
-    if ScannerType.SEMGREP not in detector.available_scanners:
-        return [], "Semgrep not available on PATH"
+def scan_semgrep_repo(project_dir: Path, cwe3: str) -> Tuple[List[Tuple[str, int, int]], Optional[str]]:
     if cwe3 not in SEMGREP_RULES:
         return [], f"Semgrep does not support CWE-{cwe3}"
+    if not check_command("semgrep"):
+        return [], "Semgrep not available on PATH"
 
     configs = SEMGREP_RULES.get(cwe3, [])
-    if not configs:
-        return [], f"No Semgrep rules configured for CWE-{cwe3}"
-
-    merged = {
-        "results": [],
-        "errors": [],
-        "meta": {"cwe": cwe3, "configs": configs, "target": "."},
-    }
+    merged = {"results": [], "errors": [], "meta": {"cwe": cwe3, "configs": configs, "target": "."}}
     any_parse_ok = False
 
-    for index, config in enumerate(configs, 1):
-        per_path = outdir / f"semgrep_{index:02d}.json"
-        cmd = [
-            "semgrep",
-            "scan",
-            "--config",
-            config,
-            "--json",
-            "--output",
-            str(per_path),
-            "--metrics=off",
-            "--quiet",
-            ".",
-        ]
-        rc, _, out, err = detector._run_cmd(cmd, cwd=project_dir)
-        if not per_path.exists():
-            merged["errors"].append(
-                {
-                    "config": config,
-                    "error": f"no output file (rc={rc}): {(err or out or '').strip()[:1000]}",
-                }
-            )
-            continue
-        try:
-            data = json.loads(per_path.read_text(encoding="utf-8", errors="replace"))
-            merged["results"].extend(data.get("results", []) or [])
-            merged["errors"].extend(data.get("errors", []) or [])
-            any_parse_ok = True
-        except Exception as exc:
-            merged["errors"].append({"config": config, "error": f"json parse failed: {exc}"})
+    with tempfile.TemporaryDirectory(prefix="semgrep_scan_") as tmpdir:
+        tmp_root = Path(tmpdir)
+        for index, config in enumerate(configs, 1):
+            per_path = tmp_root / f"semgrep_{index:02d}.json"
+            cmd = [
+                "semgrep", "scan",
+                "--config", config,
+                "--json",
+                "--output", str(per_path),
+                "--metrics=off",
+                "--quiet",
+                ".",
+            ]
+            rc, _, out, err = run_cmd(cmd, cwd=project_dir)
+            if not per_path.exists():
+                merged["errors"].append({"config": config, "error": f"no output file (rc={rc}): {(err or out or '').strip()[:1000]}"})
+                continue
+            try:
+                data = json.loads(per_path.read_text(encoding="utf-8", errors="replace"))
+                merged["results"].extend(data.get("results", []) or [])
+                merged["errors"].extend(data.get("errors", []) or [])
+                any_parse_ok = True
+            except Exception as exc:
+                merged["errors"].append({"config": config, "error": f"json parse failed: {exc}"})
 
-    merged_path = outdir / "semgrep.json"
-    merged_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
-    vulns = detector._parse_semgrep_results(merged_path, cwe3)
-
-    if any_parse_ok:
-        return vulns, None
-    return vulns, f"Semgrep outputs not parseable for CWE-{cwe3}"
+        merged_path = tmp_root / "semgrep.json"
+        merged_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        findings = parse_semgrep_results(merged_path)
+        if any_parse_ok:
+            return findings, None
+        return findings, f"Semgrep outputs not parseable for CWE-{cwe3}"
 
 
-def collect_file_ranges(vulns: Sequence) -> Dict[str, List[Tuple[int, int]]]:
+def collect_file_ranges(findings: Sequence[Tuple[str, int, int]]) -> Dict[str, List[Tuple[int, int]]]:
     file_ranges: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
-    for vuln in vulns:
-        rel_path = str(vuln.file_path or "").replace("\\", "/").lstrip("./")
-        start_line = int(vuln.line_start or 0)
-        end_line = int(vuln.line_end or start_line or 0)
-        if not rel_path or start_line <= 0 or end_line <= 0:
-            continue
-        file_ranges[rel_path].append((start_line, end_line))
+    for rel_path, start_line, end_line in findings:
+        if rel_path and start_line > 0 and end_line > 0:
+            file_ranges[rel_path].append((start_line, end_line))
     return dict(file_ranges)
 
 
@@ -443,10 +480,7 @@ def apply_removals(project_copy: Path, file_ranges: Dict[str, List[Tuple[int, in
 
 
 def write_project_outputs(project_copy: Path, report: Dict[str, List[List[int]]]) -> List[str]:
-    (project_copy / "removed_ranges.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    (project_copy / "removed_ranges.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     prompt_lines = sorted(report.keys())
     with (project_copy / "prompt.txt").open("w", encoding="utf-8") as handle:
         for rel_path in prompt_lines:
@@ -454,21 +488,14 @@ def write_project_outputs(project_copy: Path, report: Dict[str, List[List[int]]]
     return prompt_lines
 
 
-def append_global_prompt(
-    global_prompt_path: Path,
-    project_name: str,
-    prompt_lines: Sequence[str],
-    max_lines: int,
-) -> int:
+def append_global_prompt(global_prompt_path: Path, project_name: str, prompt_lines: Sequence[str], max_lines: int) -> int:
     existing_count = count_lines(global_prompt_path)
     if max_lines > 0 and existing_count >= max_lines:
         return existing_count
-
     remaining = max_lines - existing_count if max_lines > 0 else None
     lines_to_write = list(prompt_lines if remaining is None else prompt_lines[:remaining])
     if not lines_to_write:
         return existing_count
-
     global_prompt_path.parent.mkdir(parents=True, exist_ok=True)
     with global_prompt_path.open("a", encoding="utf-8") as handle:
         for rel_path in lines_to_write:
@@ -480,39 +507,23 @@ def build_output_project_dir(output_dir: Path, project_name: str, cwe3: str) -> 
     return output_dir / f"{safe_name(project_name)}__CWE-{cwe3}__CODEQL_SEMGREP_LINES"
 
 
-def scan_project(
-    detector: TimeoutCWEDetector,
-    project_dir: Path,
-    cwe3: str,
-) -> Tuple[Optional[Dict[str, List[Tuple[int, int]]]], List[str]]:
+def scan_project(project_dir: Path, cwe3: str, codeql_cwe_root: Path, codeql_timeout: int) -> Tuple[Optional[Dict[str, List[Tuple[int, int]]]], List[str]]:
+    codeql_findings, codeql_failure = scan_codeql_repo(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
+    if codeql_failure and codeql_findings is None:
+        return None, [codeql_failure]
+    semgrep_findings, semgrep_failure = scan_semgrep_repo(project_dir, cwe3)
     messages: List[str] = []
-    with tempfile.TemporaryDirectory(prefix="java_cwe_scan_") as tempdir:
-        scan_root = Path(tempdir)
-
-        sarif_path, codeql_failure = detector._scan_codeql_to_sarif(project_dir, scan_root / "codeql", cwe3)
-        if codeql_failure:
-            return None, [codeql_failure]
-        if not sarif_path:
-            return None, ["missing CodeQL SARIF output"]
-        codeql_vulns = detector._parse_sarif_results(sarif_path, cwe3)
-
-        semgrep_vulns, semgrep_failure = scan_semgrep_repo(detector, project_dir, scan_root / "semgrep", cwe3)
-        if semgrep_failure:
-            messages.append(semgrep_failure)
-
-    merged_ranges = collect_file_ranges([*codeql_vulns, *semgrep_vulns])
+    if codeql_failure:
+        messages.append(codeql_failure)
+    if semgrep_failure:
+        messages.append(semgrep_failure)
+    merged_ranges = collect_file_ranges([*(codeql_findings or []), *semgrep_findings])
     return merged_ranges, messages
 
 
-def process_project(
-    detector: TimeoutCWEDetector,
-    row: dict,
-    project_dir: Path,
-    output_dir: Path,
-    cwe3: str,
-) -> Tuple[str, List[str], int]:
+def process_project(row: dict, project_dir: Path, output_dir: Path, cwe3: str, codeql_cwe_root: Path, codeql_timeout: int) -> Tuple[str, List[str], int]:
     full_name = (row.get("full_name") or "").strip() or project_dir.name
-    file_ranges, messages = scan_project(detector, project_dir, cwe3)
+    file_ranges, messages = scan_project(project_dir, cwe3, codeql_cwe_root, codeql_timeout)
     if file_ranges is None:
         print(f"[SKIP] {full_name}: {messages[0]}")
         return "skipped", messages, 0
@@ -525,7 +536,6 @@ def process_project(
     if project_copy.exists():
         shutil.rmtree(project_copy)
     shutil.copytree(project_dir, project_copy, dirs_exist_ok=True)
-
     report = apply_removals(project_copy, file_ranges)
     prompt_lines = write_project_outputs(project_copy, report)
     extra = f" warnings={'; '.join(messages)}" if messages else ""
@@ -534,34 +544,36 @@ def process_project(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Clone Java repos from repos_java.csv, scan a single CWE with CodeQL + Semgrep, and remove vulnerable lines."
-    )
+    parser = argparse.ArgumentParser(description="Clone Java repos from repos_java.csv, scan a single CWE with CodeQL + Semgrep, and remove vulnerable lines.")
     parser.add_argument("--csv", default="./repos/repos_java.csv", help="Path to repos_java.csv")
     parser.add_argument("--projects-dir", default="./projects", help="Directory where repos are cloned")
-    parser.add_argument("--output-dir", default="./rm_output_java", help="Output root for copied and modified projects")
+    parser.add_argument("--output-dir", default="./rm_output", help="Output root for copied and modified projects")
     parser.add_argument("--global-prompt", default=None, help="Global prompt.txt path (default: <output-dir>/prompt.txt)")
     parser.add_argument("--cwe", required=True, help="Target CWE, for example 022 or CWE-022")
     parser.add_argument("--codeql-cwe-root", default=None, help="Override CodeQL Java query root")
     parser.add_argument("--codeql-timeout", type=int, default=360, help="Timeout in seconds for codeql database create/analyze")
-    parser.add_argument("--global-prompt-max-lines", type=int, default=0, help="Stop when global prompt.txt reaches this line count; 0 means unlimited")
+    parser.add_argument("--global-prompt-max-lines", type=int, default=100, help="Stop when global prompt.txt reaches this line count; 0 means unlimited")
     parser.add_argument("--limit-projects", type=int, default=0, help="Maximum number of CSV rows to inspect; 0 means unlimited")
     parser.add_argument("--project-filter", default=None, help="Only process rows whose full_name contains this string")
     parser.add_argument("--git-depth", type=int, default=1, help="git clone depth; 0 means full clone")
     args = parser.parse_args()
 
     cwe3 = normalize_cwe(args.cwe)
-    if cwe3 not in CWEDetector.SUPPORTED_CWES:
-        print(f"[ERROR] CWE-{cwe3} is not supported by java_preprocessing/cwe_detector.py")
+    if cwe3 not in SUPPORTED_CWES:
+        print(f"[ERROR] CWE-{cwe3} is not supported")
         return 2
 
     csv_path = Path(args.csv).expanduser().resolve()
     projects_dir = Path(args.projects_dir).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     global_prompt_path = Path(args.global_prompt).expanduser().resolve() if args.global_prompt else (output_dir / "prompt.txt")
-
     if not csv_path.exists():
         print(f"[ERROR] csv not found: {csv_path}")
+        return 2
+
+    codeql_cwe_root = resolve_codeql_cwe_root(args.codeql_cwe_root)
+    if cwe3 in CODEQL_SUPPORTED_CWES and not codeql_cwe_root:
+        print("[ERROR] CodeQL Java CWE query root not found. Use --codeql-cwe-root or edit DEFAULT_CODEQL_CWE_ROOT.")
         return 2
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -572,16 +584,7 @@ def main() -> int:
         print(f"[STOP] global prompt already reached limit: {initial_global_lines}/{args.global_prompt_max_lines}")
         return 0
 
-    detector = TimeoutCWEDetector(codeql_timeout_sec=args.codeql_timeout)
-    resolved_cwe_root = resolve_codeql_cwe_root(args.codeql_cwe_root)
-    if not resolved_cwe_root:
-        print("[ERROR] CodeQL Java CWE query root not found. Use --codeql-cwe-root or install codeql/java-queries.")
-        return 2
-    detector.CODEQL_CWE_ROOT = resolved_cwe_root
-    detector.codeql_queries = detector._resolve_cwe_queries_from_dir()
-
     rows = load_csv_rows(csv_path)
-
     inspected = 0
     cloned = 0
     removed_projects = 0
@@ -616,17 +619,16 @@ def main() -> int:
             print(f"[CLONED] {full_name} -> {project_dir}")
 
         status, _, prompt_line_count = process_project(
-            detector=detector,
             row=row,
             project_dir=project_dir,
             output_dir=output_dir,
             cwe3=cwe3,
+            codeql_cwe_root=codeql_cwe_root or DEFAULT_CODEQL_CWE_ROOT,
+            codeql_timeout=args.codeql_timeout,
         )
         if status == "removed":
             removed_projects += 1
-            project_prompt_lines = (build_output_project_dir(output_dir, project_dir.name, cwe3) / "prompt.txt").read_text(
-                encoding="utf-8"
-            ).splitlines()
+            project_prompt_lines = (build_output_project_dir(output_dir, project_dir.name, cwe3) / "prompt.txt").read_text(encoding="utf-8").splitlines()
             global_lines = append_global_prompt(
                 global_prompt_path=global_prompt_path,
                 project_name=repo_name,
